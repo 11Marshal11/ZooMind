@@ -1,0 +1,78 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: zoomind-db
+    environment:
+      POSTGRES_DB: zoomind
+      POSTGRES_USER: zoomind
+      POSTGRES_PASSWORD: zoomind_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: zoomind-redis-compose
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    container_name: zoomind-web
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             gunicorn ZooMind.wsgi:application --bind 0.0.0.0:8000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+
+  celery_worker:
+    build: .
+    container_name: zoomind-celery-worker
+    command: celery -A ZooMind worker -l info
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+      - web
+
+  celery_beat:
+    build: .
+    container_name: zoomind-celery-beat
+    command: celery -A ZooMind beat -l info
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+      - web
+
+  flower:
+    image: mher/flower
+    container_name: zoomind-flower-compose
+    command: celery --broker=redis://redis:6379/1 flower --address=0.0.0.0 --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
