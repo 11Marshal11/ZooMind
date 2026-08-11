@@ -1,0 +1,119 @@
+name: Daily ZooMind health
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ZooMind/**"
+      - ".github/workflows/daily-health.yml"
+  schedule:
+    - cron: "17 13 * * *"
+      timezone: "Europe/Berlin"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-zoomind-health-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  health:
+    name: Django system check and tests
+    runs-on: ubuntu-latest
+    outputs:
+      report: ${{ steps.report.outputs.content }}
+    env:
+      DJANGO_SETTINGS_MODULE: ZooMind.settings
+      SECRET_KEY: ci-daily-health
+      DEBUG: "False"
+      ALLOWED_HOSTS: "testserver,127.0.0.1,localhost"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: ZooMind/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          sed '1s/^\xEF\xBB\xBF//' ZooMind/requirements.txt > /tmp/zoomind-requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r /tmp/zoomind-requirements.txt
+
+      - name: Run Django system check
+        run: |
+          cd ZooMind
+          python manage.py check 2>&1 | tee /tmp/zoomind-check.log
+
+      - name: Run tests with coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          cd ZooMind
+          coverage run --source=main manage.py test main --verbosity 2 2>&1 | tee /tmp/zoomind-tests.log
+          coverage report 2>&1 | tee /tmp/zoomind-coverage.log
+
+      - name: Build health report
+        id: report
+        shell: bash
+        run: |
+          RUN_AT="$(TZ=Europe/Berlin date '+%Y-%m-%d %H:%M:%S %Z')"
+          TEST_SUMMARY="$(grep -E '^Ran [0-9]+ tests?' /tmp/zoomind-tests.log | tail -1 || true)"
+          COVERAGE_TOTAL="$(awk '/^TOTAL/ {print $NF}' /tmp/zoomind-coverage.log | tail -1)"
+          if [ -z "$TEST_SUMMARY" ]; then TEST_SUMMARY="Test suite completed"; fi
+          if [ -z "$COVERAGE_TOTAL" ]; then COVERAGE_TOTAL="not available"; fi
+          mkdir -p reports
+          cat > reports/daily-health.md <<EOF
+          # ZooMind daily health
+
+          Generated: $RUN_AT
+
+          Commit checked: \`$GITHUB_SHA\`
+
+          - Django system check: passed
+          - Test suite: $TEST_SUMMARY
+          - Test result: passed
+          - Coverage: $COVERAGE_TOTAL
+          - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          echo "content=$(base64 -w0 reports/daily-health.md)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish report to main
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: health
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Restore report
+        shell: bash
+        run: |
+          mkdir -p reports
+          printf '%s' '${{ needs.health.outputs.report }}' | base64 --decode > reports/daily-health.md
+
+      - name: Commit report
+        shell: bash
+        run: |
+          if [ -z "$(git status --porcelain -- reports/daily-health.md)" ]; then
+            echo "Report is already current"
+            exit 0
+          fi
+          git config user.name "11Marshal11"
+          git config user.email "236251269+11Marshal11@users.noreply.github.com"
+          git add reports/daily-health.md
+          DAY="$(TZ=Europe/Berlin date '+%Y-%m-%d')"
+          git commit -m "chore: update ZooMind daily health report ($DAY)"
+          git pull --rebase origin main
+          git push origin HEAD:main
